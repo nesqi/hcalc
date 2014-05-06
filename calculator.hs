@@ -1,5 +1,7 @@
 import Text.ParserCombinators.Parsec
 import Control.Monad
+import Numeric
+import Data.Char
 
 data Expr = Value Double
           | BinOp String Expr Expr
@@ -41,7 +43,7 @@ function = string "cos"
 atom :: Parser Expr
 atom = parenTerm
    <|> fun
-   <|> value
+   <|> valueP
    where parenTerm = do char '('; a <- statement; char ')'; return a
 
 fun :: Parser Expr
@@ -49,8 +51,22 @@ fun = do f <- function
          a <- atom
          return (UnOp f a)
 
-value :: Parser Expr
-value = liftM (Value . read) $ many1 digit
+valueP :: Parser Expr 
+valueP = (try $ string "0x" >> integerP 16)
+     <|> (try $ string "0o" >> integerP 8)
+     <|> (try $ string "0b" >> integerP 2)
+     <|> integerP 10
+     where
+        integerP base = do v <- many1 $ choice $ map (charValP) [0..(base-1)]
+                           return $ Value (fromIntegral (calc base v))
+        calc base vs = sum $ zipWith (*) (baseList base) vs
+        baseList base = map (base^) [0..]
+        charValP i = if i < 10 then
+                        char (chr $ ord '0' + i) >> return i
+                     else
+                        ((char (chr $ ord 'A' + (i-10))) 
+                        <|> (char (chr $ ord 'a' + (i-10)))) >> return i
+                    
 
 data OpType = BinRight
             | BinLeft
@@ -61,7 +77,7 @@ data Operator = Operator { opType :: OpType
                          }
 
 exprP :: Parser Expr
-exprP = inner lst where 
+exprP = inner lst where
     lst = [ [Operator BinLeft  "+",  -- level 1
              Operator BinLeft  "-"]
           , [Operator BinLeft  "*",  -- level 2
@@ -69,7 +85,7 @@ exprP = inner lst where
           , [Operator BinRight "^"]  -- level 3
           ]
     inner [] = atom
-    inner (level:levels) = 
+    inner (level:levels) =
         do a <- inner levels
            parseRest level a <|> return a
         where 
@@ -79,9 +95,9 @@ exprP = inner lst where
                 leftOrRight = case opType $ head ops of
                     BinLeft -> leftA
                     BinRight -> rightA
-                
+
                 opP = choice $ fmap infixP ops
-                
+
                 infixP op = case op of
                     (Operator BinLeft n)  -> (string n)
                     (Operator BinRight n) -> (string n)
@@ -90,6 +106,7 @@ exprP = inner lst where
                             b <- inner levels
                             leftA op (BinOp o a b)
                             <|> return a
+
             rightA op a = do o <- op
                              b <- do c <- atom
                                      rightA op c <|> return c
@@ -99,11 +116,9 @@ parseLine :: String -> Either ParseError [[Expr]]
 parseLine input = parse inLine "(unknown)" input
 
 main :: IO ()
-main = forever $ 
+main = forever $
            do l <- getLine
               case parseLine (l ++ "\n") of
                   (Right es) -> do let e = (head $ head es)
-                                   print $ show $ e
-                                   print $ show $ eval e
-                  (Left err) -> print $ show $ err
-
+                                   print $ eval e
+                  (Left err) -> print $ err
