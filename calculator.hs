@@ -3,8 +3,11 @@ import Control.Monad
 import Numeric
 import Data.Char
 import Data.List
+import qualified Data.Map.Lazy as ML
 
 data Expr = Value Integer
+          | Neg Expr
+          | Inv Expr
           | Op String Expr [ Expr ]
           | UnOp String Expr
     deriving (Eq, Show, Ord)
@@ -12,6 +15,14 @@ data Expr = Value Integer
 isValue :: Expr -> Bool
 isValue (Value _) = True
 isValue _ = False
+
+isInvValue :: Expr -> Bool
+isInvValue (Inv (Value _)) = True
+isInvValue _ = False
+
+isNegValue :: Expr -> Bool
+isNegValue (Neg (Value _)) = True
+isNegValue _ = False
 
 isOp :: Expr -> Bool
 isOp (Op _ _ _) = True
@@ -33,19 +44,12 @@ transform f old = let new = case old of
                                 a -> f a
                   in if new == old then old else transform f new 
 
-transformN :: Int -> (Expr -> Expr) -> Expr -> Expr
-transformN n f old = let new = case old of
-                                   (Op op a b) -> f (Op op (transformN (n-1) f a) (fmap (transformN (n-1) f) b))
-                                   (UnOp op a) -> f (UnOp op (transformN (n-1) f a))
-                                   a -> f a
-                     in if and [new == old, n > 0] then old else transformN (n-1) f new 
-
 flatten :: Expr -> Expr
 flatten = transform f
-    where f (Op "/" (Op "*" a b) c) = (Op "*" a (b++[(Op "/" (Value 1) c)]))
+    where f (Op "/" a b) = (Op "*" a $ fmap (Inv) b)
           f (Op "*" (Op "*" a b) c) = (Op "*" a (b ++ c))
           f (Op "*" a b) = (Op "*" a (extract "*" b))
-          f (Op "-" (Op "+" a b) c) = (Op "+" a (b++[(Op "-" (Value 0) c)]))
+          f (Op "-" a b) = (Op "+" a $ fmap (Neg) b)
           f (Op "+" (Op "+" a b) c) = (Op "+" a (b ++ c))
           f (Op "+" a b) = (Op "+" a (extract "+" b))
           f (Op op a b) = (Op op a b)
@@ -71,16 +75,17 @@ simplify = transform f
                                        [x]    -> x
                                        (x:xs) -> (Op "+" x xs)
           f (Op "+" a [Value 0]) = a
+       
+          f (Neg (Value a)) = Value $ -a
 
-          f (Op "+" a b) = merge (isValOrInv) addVal (Value 0) (Op "+" a b)
+          f (Op "+" a b) = collectSame $ mergeValues (Op "+" a b)
                            where
-                               addVal (Value t1)                     (Value t2)                     = Value $ t1 + t2
-                               addVal (Value t1)                     (Op "-" (Value t2) [Value n1]) = (Op "-" (Value $ t1 + t2) [Value n1])
-                               addVal (Op "-" (Value t1) [Value n1]) (Value t2)                     = (Op "-" (Value $ t1 + t2) [Value n1])
-                               addVal (Op "-" (Value t1) [Value n1]) (Op "-" (Value t2) [Value n2]) = (Op "-" (Value $ t1 + t2) [Value $ n1 + n2])
-                               isValOrInv (Op "-" (Value 0) [Value _]) = True
-                               isValOrInv (Value _) = True
-                               isValOrInv _ = False
+                               mergeValues = merge (isValue) addVal (Value 0)
+                               addVal (Value x) (Value y) = Value $ x + y
+
+                               collectSame = mergeEq multExpr
+                               multExpr (x, 1) = x
+                               multExpr (x, y) = (Op "*" (Value $ toInteger y) [x])
 
           -- Reduce integer devisions
           f (Op "/" (Value a) [Value b]) = if d == b then 
@@ -88,7 +93,7 @@ simplify = transform f
                                            else
                                                (Op "/" (Value $ div a d) [Value $ div b d])
                                            where d = gcd a b
-          
+
           -- Multiplication by 1 or 0
           f (Op "*" (Value 1) a) = case a of
                                        [x] -> x
@@ -97,18 +102,18 @@ simplify = transform f
           f (Op "*" (Value 0) _) = Value 0
           f (Op "*" _ [Value 0]) = Value 0
 
-          f (Op "*" a b) = merge (isValOrInv) mulVal (Value 1) (Op "*" a b)
+          f (Op "*" a b) = merge isInvOrValue mulVal (Op "/" (Value 1) [Value 1]) (Op "*" a b)
                            where
-                               mulVal (Value t1)                     (Value t2)                     = Value $ t1 * t2
-                               mulVal (Value t1)                     (Op "/" (Value t2) [Value n1]) = (Op "/" (Value $ t1 * t2) [Value n1])
-                               mulVal (Op "/" (Value t1) [Value n1]) (Value t2)                     = (Op "/" (Value $ t1 * t2) [Value n1])
-                               mulVal (Op "/" (Value t1) [Value n1]) (Op "/" (Value t2) [Value n2]) = (Op "/" (Value $ t1 * t2) [Value $ n1 * n2])
-                               isValOrInv (Op "/" (Value 1) [Value _]) = True
-                               isValOrInv (Value _) = True
-                               isValOrInv _ = False
-
+                               isInvOrValue x = or [isInvValue x, isValue x]
+                               mulVal (Value x)       (Op "/" (Value t) [Value n]) = (Op "/" (Value $ t * x) [Value n])
+                               mulVal (Inv (Value x)) (Op "/" (Value t) [Value n]) = (Op "/" (Value t) [Value $ n * x])
+                               mulVal (Op "/" (Value t) [Value n]) (Value x)       = (Op "/" (Value $ t * x) [Value n])
+                               mulVal (Op "/" (Value t) [Value n]) (Inv (Value x)) = (Op "/" (Value t) [Value $ n * x])
+                               mulVal (Op "/" (Value t) [Value n]) (Op "/" (Value x) [Value y]) = (Op "/" (Value $ t * x) [Value $ n * y])
+          
           f x = x
 
+          -- Merge different expressions
           merge collect combine ident (Op op a b) =
               let (vals, rest) = partition collect (a:b)
                   lst = if length vals > 1 then
@@ -118,6 +123,16 @@ simplify = transform f
               in case lst of
                   [x]    -> x
                   (x:xs) -> (Op op x xs)
+          
+          -- Merge equal expressions
+          mergeEq :: ((Expr, Int) -> Expr) -> Expr -> Expr
+          mergeEq f (Op op a b) = let lst = fmap f $ nubCount (a:b)
+                                  in case lst of
+                                      [x]    -> x
+                                      (x:xs) -> (Op op x xs)
+
+          nubCount :: Ord a => [a] -> [(a, Int)]
+          nubCount = ML.toList . ML.fromListWith (+) . flip zip (repeat 1)
 
 
 -- a/b*c -> (a*c)/b
