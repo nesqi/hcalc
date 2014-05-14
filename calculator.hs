@@ -1,11 +1,11 @@
 import Text.ParserCombinators.Parsec
 import Control.Monad
-import Numeric
 import Data.Char
+import Data.Ratio
 import Data.List
 import qualified Data.Map.Lazy as ML
 
-data Expr = Value Integer
+data Expr = Value Rational
           | Neg Expr
           | Inv Expr
           | Op String Expr [ Expr ]
@@ -63,76 +63,83 @@ flatten = transform f
 
 simplify :: Expr -> Expr
 simplify = transform f
-    where f (Op "^" (Value a) [(Value b)]) = if b < 0 then
-                                                 Op "/" (Value 1) [(Value $ a ^ (-b))]
-                                             else
-                                                 (Value $ a ^ b)
+    where f (Op "^" (Value a) [(Value b)]) = case (b >= 0, (denominator b) == 1) of
+                                                 (True,  True) -> (Value $ a ^ (numerator b))
+                                                 _             -> (Op "^" (Value a) [(Value b)])
 
           f (Op "-" (Value x) [Value y]) = Value $ x - y
 
           -- Addition of 0
-          f (Op "+" (Value 0) a) = case a of
-                                       [x]    -> x
-                                       (x:xs) -> (Op "+" x xs)
+          f (Op "+" (Value 0) a) = toOp "+" a
           f (Op "+" a [Value 0]) = a
        
           f (Neg (Value a)) = Value $ -a
 
-          f (Op "+" a b) = collectSame $ mergeValues (Op "+" a b)
+          f (Op "+" a b) = toOp "+" $ merge (+) lowerT liftT (a:b)
                            where
-                               mergeValues = merge (isValue) addVal (Value 0)
-                               addVal (Value x) (Value y) = Value $ x + y
-
-                               collectSame = mergeEq multExpr
-                               multExpr (x, 1) = x
-                               multExpr (x, y) = (Op "*" (Value $ toInteger y) [x])
+                               liftT (Op "*" (Value x) [y]) = (y, Just x)
+                               liftT (Op "*" y [Value x]) = (y, Just x)
+                               liftT (Value x) = (Value 1, Just x)
+                               liftT (Neg x) = (x, Just (-1))
+                               liftT (x) = (x, Just 1)
+                               
+                               lowerT (_, Just 0)  = []
+                               lowerT ((Value 1), Just x)  = [(Value x)]
+                               lowerT (x, Just (-1)) = [Neg x]
+                               lowerT (x, Just 1)  = [x]
+                               lowerT (x, Just y)  = [(Op "*" (Value $ y) [x])]
 
           -- Reduce integer devisions
-          f (Op "/" (Value a) [Value b]) = if d == b then 
-                                               Value $ div a b
-                                           else
-                                               (Op "/" (Value $ div a d) [Value $ div b d])
-                                           where d = gcd a b
+          f (Op "/" (Value a) [Value b]) = (Value $ a / b)
 
           -- Multiplication by 1 or 0
-          f (Op "*" (Value 1) a) = case a of
-                                       [x] -> x
-                                       (x:xs) -> (Op "*" x xs)
+          f (Op "*" (Value 1) a) = toOp "*" a
           f (Op "*" a [Value 1]) = a
           f (Op "*" (Value 0) _) = Value 0
           f (Op "*" _ [Value 0]) = Value 0
 
-          f (Op "*" a b) = merge isInvOrValue mulVal (Op "/" (Value 1) [Value 1]) (Op "*" a b)
+          f (Op "*" a b) = toOp "*" $ mergeValues (a:b)
                            where
-                               isInvOrValue x = or [isInvValue x, isValue x]
-                               mulVal (Value x)       (Op "/" (Value t) [Value n]) = (Op "/" (Value $ t * x) [Value n])
-                               mulVal (Inv (Value x)) (Op "/" (Value t) [Value n]) = (Op "/" (Value t) [Value $ n * x])
-                               mulVal (Op "/" (Value t) [Value n]) (Value x)       = (Op "/" (Value $ t * x) [Value n])
-                               mulVal (Op "/" (Value t) [Value n]) (Inv (Value x)) = (Op "/" (Value t) [Value $ n * x])
-                               mulVal (Op "/" (Value t) [Value n]) (Op "/" (Value x) [Value y]) = (Op "/" (Value $ t * x) [Value $ n * y])
+                               -- Merge values
+                               mergeValues = merge (*) lowerVal liftVal
+                               
+                               liftVal (Value x)       = (Value 1, Just x)
+                               liftVal (Inv (Value x)) = (Value 1, Just $ 1 / x)
+                               liftVal (x) = (x, Nothing)
+                               
+                               lowerVal (_, Just 0) = []
+                               lowerVal ((Value 1), Just x)  = [(Value x)]
+                               lowerVal (x, Nothing)  = [x]
+                               
+                               -- Merge Expressions
+                               mergeExpr = merge (+) lowerExpr liftExpr
+                               
+                               liftExpr (Value x)       = (Value x, Nothing)
+                               liftExpr (Inv (Value x)) = (Inv (Value x), Nothing)
+                               liftExpr (Op "*" (Value x) [y]) = (y, Just x)
+                               liftExpr (Op "*" y [Value x]) = (y, Just x)
+                               liftExpr (Neg x) = (x, Just (-1))
+                               liftExpr (x) = (x, Just 1)
+                               
+                               lowerExpr (_, Just 0)  = []
+                               lowerExpr ((Value 1), Just x)  = [(Value x)]
+                               lowerExpr (x, Just (-1)) = [Neg x]
+                               lowerExpr (x, Just 1)  = [x]
+                               lowerExpr (x, Just y)  = [(Op "^" x [Value $ y])]
+                               lowerExpr (x, Nothing)  = [x]
           
           f x = x
 
-          -- Merge different expressions
-          merge collect combine ident (Op op a b) =
-              let (vals, rest) = partition collect (a:b)
-                  lst = if length vals > 1 then
-                            (foldr combine ident vals):rest
-                        else
-                            a:b
-              in case lst of
-                  [x]    -> x
-                  (x:xs) -> (Op op x xs)
+          merge cOp down up l = let (process, pass) = partition hasValue $ fmap up l
+                                    merged = ML.toList . ML.fromListWith (liftM2 cOp) $ process
+                                    hasValue (_, Just _) = True
+                                    hasValue _           = False
+                                in foldl1 (++) $ fmap down $ merged ++ pass
           
-          -- Merge equal expressions
-          mergeEq :: ((Expr, Int) -> Expr) -> Expr -> Expr
-          mergeEq f (Op op a b) = let lst = fmap f $ nubCount (a:b)
-                                  in case lst of
-                                      [x]    -> x
-                                      (x:xs) -> (Op op x xs)
-
-          nubCount :: Ord a => [a] -> [(a, Int)]
-          nubCount = ML.toList . ML.fromListWith (+) . flip zip (repeat 1)
+          toOp op lst = case lst of
+                            [] -> Value 0
+                            [x] -> x
+                            (x:xs) -> (Op op x xs)
 
 
 -- a/b*c -> (a*c)/b
