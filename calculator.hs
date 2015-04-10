@@ -1,3 +1,5 @@
+module Main where
+
 import Text.ParserCombinators.Parsec
 import Control.Monad
 import Data.Char
@@ -5,10 +7,15 @@ import Data.Ratio
 import Data.List
 import qualified Data.Map.Lazy as ML
 
+import Data.IORef
+import Test.QuickCheck
+
+import GHC.IO
+
 --TODO: 
 -- Nice printouts
 -- Evaluation (Simplification + evaluation)
--- Tests (quick check)
+-- Tests (quickCheck)
 -- Print out mode (Dec, Hex, Oct, ...)
 -- Variables
 -- Functions
@@ -21,10 +28,45 @@ data Expr = Value Rational
           | UnOp String Expr
     deriving (Eq, Show, Ord)
 
+-- For quickCheck
+instance Arbitrary Expr where
+    arbitrary = sized exprTree
+        where exprTree 0 = liftM Value arbitrary
+              exprTree n = oneof [ liftM Neg $ exprTree $ n-1,
+                                   liftM Inv $ exprTree $ n-1,
+                                   do m <- choose(1, n)
+                                      op <- someOp
+                                      expr <- exprTree $ n-m
+                                      lst <- case m of 
+                                                (1) -> do z <- exprTree 0 
+                                                          return $ [ z ]
+                                                (o) -> resize m $ listOf1 (exprTree $ (n `div` o) - 1)
+                                      return $ Op op expr lst,
+                                   liftM2 UnOp someUnOp (exprTree $ n-1) ]
+              someOp = elements [ "+", "-", "*", "/", "^" ]
+              someUnOp = elements [ "sin", "cos" ]
+
+    shrink (Value x) = []
+    shrink (Neg x) = [x] ++ [Neg x' | x' <- shrink x]
+    shrink (Inv x) = [x] ++ [Inv x' | x' <- shrink x]
+    shrink (UnOp op x) = [x] ++ [UnOp op x' | x' <- shrink x]
+    shrink (Op op x y)  = [Op op x' y' | (x', y') <- shrink (x, y), y' /= [] ]
+
+exprToString :: Expr -> String
+exprToString (Value x) = if denominator x == 1
+                         then show $ numerator x
+                         else foldl1 (++) ["(", show $ numerator x, "/", show $ denominator x, ")"]
+exprToString (Neg e) = "-" ++ exprToString e
+exprToString (Inv e) = "(1/" ++ exprToString e ++ ")"
+exprToString (Op op a b) = "(" ++ (foldl1 (\x y -> x++op++y) $ fmap (exprToString) (a:b)) ++ ")"
+exprToString (UnOp f a) = f ++ (exprToString a)
+
 transform :: (Expr -> Expr) -> Expr -> Expr
 transform f old = let new = case old of
                                 (Op op a b) -> f (Op op (transform f a) (fmap (transform f) b))
                                 (UnOp op a) -> f (UnOp op (transform f a))
+                                (Inv a) -> f (Inv (transform f a))
+                                (Neg a) -> f (Neg (transform f a))
                                 a -> f a
                   in if new == old then old else transform f new 
 
@@ -50,18 +92,27 @@ data Ent a = CombineE Expr a -- Expression that should be combined
            | Pass Expr       -- Don't combine just pass along
     deriving (Eq)
 
+expNumOfDigitsInBase10 :: Floating a => a -> a -> a
+expNumOfDigitsInBase10 a b = b * (log a) / (log 10)
+
 simplify :: Expr -> Expr
 simplify = transform f
-    where f (Op "^" (Value a) [(Value b)]) = case (b >= 0, (denominator b) == 1) of
-                                                 (True,  True) -> (Value $ a ^ (numerator b))
-                                                 _             -> (Op "^" (Value a) [(Value b)])
+    where f (Op "^" (Value a) [(Value b)]) = if and [b >= 0, 
+                                                    denominator b == 1,
+                                                    expNumOfDigitsInBase10 (fromRational a) (fromRational b) < 50 ] 
+                                                then
+                                                    (Value $ a ^ (numerator b))
+                                                else
+                                                    (Op "^" (Value a) [(Value b)])
 
           f (Op "-" (Value x) [Value y]) = Value $ x - y
 
           -- Addition of 0
           f (Op "+" (Value 0) a) = toOp "+" a
           f (Op "+" a [Value 0]) = a
+          f (Inv (Inv x)) = x
           f (Inv (Value a)) = Value $ 1/a
+          f (Neg (Neg x)) = x
           f (Neg (Value a)) = Value $ -a
 
           f (Op "+" a b) = toOp "+" $ merge lowerT liftT (a:b)
@@ -82,7 +133,7 @@ simplify = transform f
                                    | (n 0) == 1 = [x]
                                    | otherwise = [Op "*" (Value $ n 0) [x]]
 
-          -- Reduce integer devisions
+          -- Reduce integer divisions
           f (Op "/" (Value a) [Value b]) = (Value $ a / b)
 
           -- Multiplication by 1 or 0
@@ -100,7 +151,7 @@ simplify = transform f
                                liftE (Value x)       = [CombineI (x*)]
                                liftE (Inv (Value x)) = [CombineI ((1/x)*)]
                                -- Expr
-                               liftE (Op "^" (Value x) [y]) = [CombineE y (x+)]
+                               --liftE (Op "^" (Value x) [y]) = [CombineE (Value x) (y+)]
                                liftE (Op "^" y [Value x])   = [CombineE y (x+)] 
                                liftE (Inv x) = [CombineE x (-1+)]
                                liftE (x) = [CombineE x (1+)]
@@ -222,12 +273,40 @@ exprP = inner lst where
 parseLine :: String -> Either ParseError [[Expr]]
 parseLine input = parse inLine "(unknown)" input
 
-main :: IO ()
-main = do print "HCalc"
+parseString :: String -> Maybe Expr
+parseString str = case parseLine $ str ++ "\n" of
+                      (Right [[e]]) -> Just e
+                      _ -> Nothing
+
+-- QuickCheck
+prop_simplify :: Expr -> Bool
+prop_simplify x = simplify (Op "*" (Value 2) [x]) == simplify (Op "+" x [x])
+
+--prop_print_and_parse :: Expr -> Bool
+--prop_print_and_parse x = maybe False (\y -> exprToString x == exprToString y) (parseString (exprToString x))
+
+check :: IO ()
+check = do verboseCheck prop_simplify
+--           verboseCheck prop_print_and_parse
+
+-- Repl...
+-- type Env = IORef [(String, IORef Expr)]
+
+-- nullEnv :: IO Env
+-- nullEnv = newIORef []
+
+repl :: IO ()
+repl = do putStr "HCalc\n"
           forever $
               do l <- getLine
                  case parseLine (l ++ "\n") of
-                     (Right es) -> do let e = (head $ head es)
-                                      print $ e
-                                      print $ simplify $ flatten e
-                     (Left err) -> print $ err
+                     (Right [[e]]) -> do 
+                         putStrLn $ show e
+                         putStrLn $ maybe "Could not parse" exprToString (parseString $ exprToString e)
+                         putStrLn $ exprToString e
+                         putStrLn $ (exprToString $ simplify $ flatten e)
+                     (Right _) -> putStr "Error: no input.\n"
+                     (Left err) -> putStr $ show err
+
+main :: IO ()
+main = repl
